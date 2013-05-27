@@ -1,0 +1,130 @@
+#!/usr/bin/perl -w
+#use strict;
+use Data::Dumper;
+use Cwd;
+use File::Basename;
+use POSIX qw(WNOHANG setsid);
+use IO::Socket;
+use IO::Select;
+use threads;
+use threads::shared;
+
+our $dir = dirname(dirname(Cwd::abs_path(__FILE__)));
+my $pid_file = $dir.'/logs/agent.pid';
+my $script_dir = $dir.'/scripts';
+my $config_file = $dir.'/etc/agent.conf';
+
+require $dir.'/lib/become_daemon.pl';
+require $dir.'/lib/config.pl';
+require $dir.'/lib/log.pl';
+
+#-----------------get config-----------------
+my $config = config_file($config_file);
+
+#-----------------listen and daemon--------------
+my $listen_sock = IO::Socket::INET->new(LocalPort => "$config->{port}",
+					Listen => 20,
+					Proto => 'tcp',
+					Reuse => 1,
+					Timeout => 30);
+die "Can't create a listening socket:$!" unless $listen_sock;
+my $reader = IO::Select->new() or die  "Can't create IO::Select read object";
+$reader->add($listen_sock);
+my $pid = become_daemon("$script_dir","$config->{user}","$config->{group}");
+my $fh = open_pid_file($pid_file);
+print $fh $pid;
+close $fh;
+
+open LOG,">>$dir/logs/access.log";
+LOG->autoflush(1);
+share($LOG);
+$SIG{PIPE} = $SIG{HUP} = $SIG{TERM} = 'IGNORE';
+share($SIG);
+#------------------socket loop-----------------
+while(1)
+{
+	my @handle = $reader->can_read(10);	
+	for(@handle)
+	{
+		if($_ eq $listen_sock)
+		{
+			my $connect = $listen_sock->accept();
+			$reader->add($connect);
+		}
+		else
+		{
+			my $buffer;
+			my $byte = sysread($_,$buffer,1024);
+			chomp $buffer;
+			if (defined $byte)
+                        {
+                                if ($byte == 0)
+                                {
+                                        write_log(LOG,"Error:remote host closes the connection");
+                                        $reader->remove($_);
+                                        next;
+                                }
+                        }
+                        else
+                        {
+				write_log(LOG,"Error:sockt read error");
+                                $reader->remove($_);
+                                next;
+                        }
+			my($port,$addr)= sockaddr_in($_->peername());
+                        $addr = inet_ntoa($addr);
+			$buffer =~ s/(\r|\.\.|\s+)//g;	
+			write_log(LOG,"$addr:$port	$buffer");
+			my $len = length $buffer;
+			if ($len == 0 )
+			{
+				print $_ "Error:command length is zero\n";
+				next;
+			}
+			my($script,$args) = &parse_cmd($buffer);
+			next unless(defined $script);
+			if("$script" =~ /quit|exit/i)
+			{
+				$reader->remove($_);	
+				$_->close;
+				next;
+			}
+
+			my $cmd_file = "$script_dir/$script";
+			if(-e "$cmd_file")
+			{
+				my $th = threads->create(\&exe,$cmd_file,$args,$_,$addr,$port);
+				$th->detach();
+				next;
+			}
+			else
+			{
+				print $_ "Error:no file exist\n";
+				next;
+			}
+		}
+	}
+}
+
+#-----------------------parse url----------------------------------------
+sub parse_cmd
+{
+	my $cmd = shift;
+	my($script,$args) = (split /\?/,$cmd)[0,1];
+	return $script,$args;
+}
+
+sub exe
+{
+	my($cmd_file,$args,$socket,$addr,$port) = @_;
+	$args =~ s/&/\\&/g;
+	eval
+	{
+		open SLOG,"$cmd_file $args | " or print $socket "$!";
+        	while(<SLOG>)
+        	{
+			last unless print $socket "$_";
+        	}
+        	close SLOG;
+	};
+}

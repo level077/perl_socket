@@ -1,0 +1,18 @@
+#!/bin/sh
+
+echo "$1" >/tmp/xx
+
+ip=$(ifconfig | awk -F ':' '/inet addr:10\./ {print $2}' |awk '{print $1}')
+
+curl -H  "host:yushuiping.19lou.com" -d "ip=$ip&status=2" 10.1.1.107/update_status
+
+for x  in  {1..20}
+do
+	echo "$HOSTNAME		$x 	$1"
+	sleep 1
+done
+echo "DONE"
+
+curl -H "host:yushuiping.19lou.com" -d "ip=$ip&status=3" 10.1.1.107/update_status
+
+curl -H "host:yushuiping.19lou.com" -d "$1" 10.1.1.107/sub_publish
